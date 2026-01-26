@@ -1,0 +1,212 @@
+# Henry Belik
+# July 2025
+# Enhanced GUI Photo Sorter with Filters, Progress, Cancel Support, and Color Styling
+
+import shutil
+import stat
+from pathlib import Path
+from PIL import Image
+from PIL.ExifTags import TAGS
+from datetime import datetime
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+import threading
+from tkinter import scrolledtext
+from tkinter import BooleanVar, StringVar
+
+try:
+    from pillow_heif import register_heif_opener
+    register_heif_opener()
+except ImportError:
+    pass
+
+image_extensions = ['.jpg', '.jpeg', '.png', '.heic']
+video_extensions = ['.mp4', '.mov', '.avi', '.mkv', '.wmv', '.mts']
+
+cancel_flag = threading.Event()
+
+def get_date_taken(path: Path):
+    try:
+        with Image.open(path) as image:
+            exif_data = image.getexif()
+            for tag in ['DateTimeOriginal', 'DateTimeDigitized', 'DateTime']:
+                tag_id = next((k for k, v in TAGS.items() if v == tag), None)
+                if tag_id and tag_id in exif_data:
+                    value = exif_data.get(tag_id)
+                    return datetime.strptime(value, "%Y:%m:%d %H:%M:%S")
+    except:
+        pass
+    try:
+        return datetime.fromtimestamp(path.stat().st_mtime)
+    except:
+        return None
+
+def sort_files_gui(source_folder, destination_base, log_folder, log_callback,
+                    allowed_extensions, date_start, date_end, progress_callback):
+    source_folder = Path(source_folder)
+    destination_base = Path(destination_base)
+    log_folder = Path(log_folder)
+    folder_cache = {}
+
+    start_time = datetime.now()
+    log_file_path = log_folder / f"sort_log_{start_time.strftime('%Y-%m-%d_%H-%M-%S')}.txt"
+
+    def log(message):
+        log_callback(message)
+        with open(log_file_path, 'a', encoding='utf-8') as log_file:
+            log_file.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - {message}\n")
+
+    all_files = [p for p in source_folder.rglob("*") if p.is_file() and p.suffix.lower() in allowed_extensions]
+    total = len(all_files)
+    moved = 0
+
+    for idx, file_path in enumerate(all_files):
+        if cancel_flag.is_set():
+            log("Sorting cancelled by user.")
+            return
+
+        date_taken = get_date_taken(file_path)
+        if not date_taken:
+            log(f"No date found for {file_path.name}, skipping.")
+            continue
+
+        if not (date_start <= date_taken <= date_end):
+            continue
+
+        year = str(date_taken.year)
+        month_name = f"{date_taken.month} {date_taken.strftime('%B')} {date_taken.year}"
+        day_name_base = f"{date_taken.month}-{date_taken.day}-{date_taken.year}"
+        cache_key = (year, month_name, day_name_base)
+        dest_folder = folder_cache.get(cache_key)
+
+        if not dest_folder:
+            parent_folder = destination_base / year / month_name
+            # Search for any folder that starts with day_name_base
+            if parent_folder.exists():
+                for child in parent_folder.iterdir():
+                    if child.is_dir() and child.name.startswith(day_name_base):
+                        dest_folder = child
+                        break
+
+            # If no matching folder found, create one
+            if not dest_folder:
+                dest_folder = parent_folder / day_name_base
+                dest_folder.mkdir(parents=True, exist_ok=True)
+
+            folder_cache[cache_key] = dest_folder
+
+        dest_path = dest_folder / file_path.name
+
+        if dest_path.exists():
+            log(f"Skipping {file_path.name}: already exists in destination.")
+            continue
+
+        try:
+            shutil.move(str(file_path), str(dest_path))
+            log(f"Moved {file_path.name} to {dest_path}")
+            moved += 1
+        except OSError:
+            try:
+                shutil.copy2(file_path, dest_path)
+                file_path.chmod(stat.S_IWRITE)
+                file_path.unlink()
+                log(f"Copied and deleted: {file_path.name}")
+                moved += 1
+            except Exception as delete_err:
+                log(f"Copied but failed to delete {file_path.name}: {delete_err}")
+
+        progress_callback(int((idx + 1) / total * 100))
+
+    log("Sorting completed.")
+    messagebox.showinfo("Done", "Sorting completed successfully!")
+
+def run_gui():
+    def browse(entry):
+        path = filedialog.askdirectory()
+        if path:
+            entry.set(path)
+
+    def start_sort():
+        cancel_flag.clear()
+        log_box.delete('1.0', tk.END)
+        progress_bar['value'] = 0
+
+        source = source_var.get()
+        dest = dest_var.get()
+        log_dir = log_var.get()
+        selected_exts = [ext for ext, var in ext_vars.items() if var.get()]
+        if not selected_exts:
+            messagebox.showerror("Missing Input", "Select at least one file extension.")
+            return
+
+        start_date = datetime.strptime(start_date_var.get(), "%Y-%m-%d")
+        end_date = datetime.strptime(end_date_var.get(), "%Y-%m-%d")
+
+        Path(log_dir).mkdir(parents=True, exist_ok=True)
+
+        threading.Thread(target=sort_files_gui, args=(
+            source, dest, log_dir,
+            lambda msg: log_box.insert(tk.END, msg + "\n"),
+            selected_exts, start_date, end_date,
+            lambda pct: progress_bar.configure(value=pct)
+        )).start()
+
+    def cancel_sort():
+        cancel_flag.set()
+
+    root = tk.Tk()
+    root.title("Photo Sorter")
+    root.geometry("640x700")
+    root.configure(bg="#f0f0f0")
+
+    style = ttk.Style()
+    style.theme_use("default")
+    style.configure("TButton", padding=6, relief="flat", background="#0078D7", foreground="white")
+    style.configure("TProgressbar", troughcolor="#ddd", background="#4CAF50")
+
+    source_var = StringVar()
+    dest_var = StringVar()
+    log_var = StringVar(value="D:\\Pictures\\Pictures sorting Logs")
+    start_date_var = StringVar(value="1900-01-01")
+    end_date_var = StringVar(value="2100-12-31")
+
+    def make_path_picker(label, var):
+        frame = tk.Frame(root, bg="#f0f0f0")
+        frame.pack(fill="x", padx=10, pady=5)
+        tk.Label(frame, text=label, width=15, bg="#f0f0f0").pack(side=tk.LEFT)
+        tk.Entry(frame, textvariable=var, width=50).pack(side=tk.LEFT, expand=True)
+        ttk.Button(frame, text="Browse", command=lambda: browse(var)).pack(side=tk.LEFT)
+
+    make_path_picker("Source Folder:", source_var)
+    make_path_picker("Destination Folder:", dest_var)
+    make_path_picker("Log Folder:", log_var)
+
+    frame = tk.Frame(root, bg="#f0f0f0")
+    frame.pack(fill="x", padx=10, pady=5)
+    tk.Label(frame, text="Start Date:", bg="#f0f0f0").pack(side=tk.LEFT)
+    tk.Entry(frame, textvariable=start_date_var, width=12).pack(side=tk.LEFT, padx=5)
+    tk.Label(frame, text="End Date:", bg="#f0f0f0").pack(side=tk.LEFT)
+    tk.Entry(frame, textvariable=end_date_var, width=12).pack(side=tk.LEFT)
+
+    tk.Label(root, text="Include File Types:", bg="#f0f0f0").pack()
+    ext_vars = {ext: BooleanVar(value=True) for ext in image_extensions + video_extensions}
+    ext_frame = tk.Frame(root, bg="#f0f0f0")
+    ext_frame.pack()
+    for ext, var in ext_vars.items():
+        tk.Checkbutton(ext_frame, text=ext, variable=var, bg="#f0f0f0").pack(side=tk.LEFT)
+
+    btn_frame = tk.Frame(root, bg="#f0f0f0")
+    btn_frame.pack(pady=10)
+    ttk.Button(btn_frame, text="Start Sorting", command=start_sort).pack(side=tk.LEFT, padx=10)
+    ttk.Button(btn_frame, text="Cancel", command=cancel_sort).pack(side=tk.LEFT, padx=10)
+
+    progress_bar = ttk.Progressbar(root, length=580)
+    progress_bar.pack(pady=5, padx=10)
+
+    log_box = scrolledtext.ScrolledText(root, height=15, wrap=tk.WORD, bg="#ffffff", fg="#000000")
+    log_box.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+    root.mainloop()
+
+if __name__ == "__main__":
+    run_gui()
