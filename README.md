@@ -1,103 +1,114 @@
-Enhanced GUI Photo Sorter
-# Enhanced GUI Photo Sorter
+# Photo & Video Sorter Pro
 
-A Python-based desktop application for automatically organizing photos and videos by date using a user-friendly graphical interface.
+A modern, high-performance Python desktop application for automatically organizing large collections of photos and videos by date using a sleek CustomTkinter interface.
 
-This tool scans a source directory, extracts metadata (EXIF when available), and sorts media into a structured folder hierarchy by **year → month → day**.
+This tool scans a source directory using multi-threaded parallel processing, computes MD5 hashes to prevent duplicate imports, extracts photo (EXIF) and video (Hachoir) metadata, and sorts media into a clean **Year → Month → Day** folder hierarchy.
+
 ---
 
 ## Features
 
-- **Automatic file organization**
-  - Sorts images and videos into folders by date
-  - Structure: `Year / Month / Day`
+- **Modern Desktop GUI**
+  - Built with `CustomTkinter` supporting system-matched dark/light themes.
+  - Dedicated configuration windows for granular file-type toggles.
 
-- **EXIF metadata support**
-  - Uses `DateTimeOriginal` when available
-  - Falls back to file modification date if needed
+- **High-Speed Parallel Processing**
+  - Utilizes Python's `ThreadPoolExecutor` and `scandir` for fast directory traversing and multi-threaded file transfers.
 
-- **Graphical User Interface (GUI)**
-  - Built with Tkinter
-  - Easy folder selection and controls
+- **Smart Metadata Extraction**
+  - **Photos:** Reads EXIF metadata tags (`DateTimeOriginal`, `DateTimeDigitized`, `DateTime`) with support for HEIC/HEIF (iPhone) formats.
+  - **Videos:** Extracts native creation timestamps using `Hachoir`.
+  - **Fallback:** Uses file modification dates if metadata tags are unreadable.
 
-- **File filtering**
-  - Select which file types to include:
-    - Images: `.jpg`, `.jpeg`, `.png`, `.heic`
-    - Videos: `.mp4`, `.mov`, `.avi`, `.mkv`, `.wmv`, `.mts`
+- **Duplicate Hash Skipping & Auto-Renaming**
+  - Computes MD5 file hashes to detect and skip true byte-for-byte duplicates.
+  - Automatically appends unique numerical suffixes (`image_1.jpg`) to prevent collisions if different files share identical filenames.
 
-- **Date range filtering**
-  - Only process files within a specified date range
+- **Separate Video Destination Support**
+  - Option to route videos to a dedicated base directory while photos go to another, keeping video archives organized independently.
 
-- **Progress tracking**
-  - Real-time progress bar
+- **Dry Run (Simulation) & Operations**
+  - Choice between **Move** or **Copy** operations.
+  - **Dry Run Mode:** Test and log the proposed directory restructuring without modifying or moving files on disk.
 
-- **Logging system**
-  - Detailed logs saved to a file
-  - Live log output in the GUI
+- **Automatic Source Folder Cleanup**
+  - Optional post-sort operation to prune empty subdirectories from the source location after files are moved.
 
-- **Cancel support**
-  - Stop sorting safely mid-process
+- **Date Range Filtering & Progress Tracking**
+  - Filter target media within a specific `YYYY-MM-DD` window.
+  - Live progress bar, instant UI status logging, and post-run summary window.
 
-- **Efficient folder handling**
-  - Uses caching to avoid redundant folder lookups
+- **Robust Error & Crash Handling**
+  - Global uncaught exception interceptor logs full stack traces to `~/sort_images_crash_log.txt` and alerts via popup.
+  - Handles cross-filesystem and MTP read permission fallback gracefully (`shutil.copy2` + `unlink`).
 
 ---
 
 ## Folder Structure Output
-Files are organized like this (example):
+
+Sorted media files are organized into the following directory structure:
+
 
 Destination/
-2023/
-7 July 2023/
-7-15-2023/
-image1.jpg
-video1.mp4
-
+└── 2023/
+    └── 7 July 2023/
+        └── 7-15-2023/
+            ├── IMG_001.jpg
+            ├── IMG_002.heic
+            └── VID_001.mp4
 ---
 
 ## Requirements
   Python 3.x
 
 Required packages:
-  pip install pillow
+  pip install pillow customtkinter hachoir
   Optional (for HEIC support):
     pip install pillow-heif
 
 How to Run
-  python your_script_name.py
+  python main.py
+
 How to Use
   Launch the application
   Select:
     Source Folder (where your media is located)
-    Destination Folder (where sorted files will go)
+    Photo Destination Folder (where sorted photos will go)
+    Video Destination Folder (optional separate location for videos)
     Log Folder (where logs will be saved)
   Choose:
-    File types to include
-    Date range
+    File types to include (via File Types menu)
+    Date range filter
+    Operation mode (Move or Copy files)
+    Dry Run mode (simulate without moving files)
     Click Start Sorting
-    Monitor progress and logs in real time
+    Monitor progress and live logs in real time
     Use Cancel if needed
 
 How It Works:
-  Attempts to read EXIF metadata from images
+  Uses multi-threaded parallel processing for fast directory scanning
+  Attempts to read EXIF metadata from photos and Hachoir metadata from videos
   Falls back to file modification timestamp if metadata is missing
-  Moves files into structured directories
-  Avoids duplicates by skipping existing files
-  Handles file permission issues gracefully (copy + delete fallback)
+  Computes MD5 hashes to detect and skip byte-for-byte duplicate files
+  Appends numerical suffixes to prevent filename collisions
+  Moves or copies files into structured directories (Year / Month / Day)
+  Cleans up empty subdirectories in the source folder if enabled
+  Handles file permission and cross-drive issues gracefully (copy + delete fallback)
 
 Notes:
-  Files without valid date information are skipped
-  Duplicate filenames in destination are not overwritten
-  Large directories may take time depending on file count
+  Files without valid date information fallback to file creation/modification dates
+  Duplicate content (matching MD5 hash) is automatically skipped
+  Destination files with matching names but different content are safely auto-renamed
+  Crashing or unexpected errors are caught globally and logged to a crash file
 
 Future Improvements:
   Thumbnail previews
   Drag-and-drop support
-  Parallel processing for faster sorting
   Exportable summary statistics
   Config file support
   FAISS recognition
-
+  
 Author
 Henry Belik
 July 2025
+updated August 2026
