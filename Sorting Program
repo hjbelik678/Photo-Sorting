@@ -1,212 +1,816 @@
 # Henry Belik
-# July 2025
-# Enhanced GUI Photo Sorter with Filters, Progress, Cancel Support, and Color Styling
+# Modern GUI Photo & Video Sorter Pro with Parallel Processing, Auto-Renaming, Duplicate Hash Skipping & Source Cleanup
 
+import hashlib
+import logging
+import os
 import shutil
 import stat
+import sys
+import threading
+
+import customtkinter as ctk
+import tkinter as tk
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 from pathlib import Path
+from tkinter import filedialog, messagebox
+
 from PIL import Image
 from PIL.ExifTags import TAGS
-from datetime import datetime
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
-import threading
-from tkinter import scrolledtext
-from tkinter import BooleanVar, StringVar
+
+# Video metadata extractor
+from hachoir.metadata import extractMetadata
+from hachoir.parser import createParser
 
 try:
     from pillow_heif import register_heif_opener
+
     register_heif_opener()
 except ImportError:
     pass
 
-image_extensions = ['.jpg', '.jpeg', '.png', '.heic']
-video_extensions = ['.mp4', '.mov', '.avi', '.mkv', '.wmv', '.mts']
+ctk.set_appearance_mode("System")
+ctk.set_default_color_theme("blue")
+
+image_extensions = [".jpg", ".jpeg", ".png", ".heic"]
+video_extensions = [".mp4", ".mov", ".avi", ".mkv", ".wmv", ".mts"]
 
 cancel_flag = threading.Event()
 
-def get_date_taken(path: Path):
+# Set up automatic crash logging
+LOG_FILE = Path.home() / "sort_images_crash_log.txt"
+logging.basicConfig(
+    filename=LOG_FILE,
+    level=logging.ERROR,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
+
+
+def global_exception_handler(exc_type, exc_value, exc_traceback):
+    """Log uncaught errors to file and show a popup message box."""
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+
+    logging.error(
+        "Uncaught exception encountered",
+        exc_info=(exc_type, exc_value, exc_traceback),
+    )
+
+    messagebox.showerror(
+        "Unexpected Application Error",
+        f"An error occurred while running the app:\n\n{exc_value}\n\nError details saved to:\n{LOG_FILE}",
+    )
+
+
+# Intercept system and Tkinter errors globally
+sys.excepthook = global_exception_handler
+tk.Tk.report_callback_exception = global_exception_handler
+
+
+# High-speed recursive directory scanner
+def fast_scandir(top_dir, allowed_extensions):
+    files = []
     try:
-        with Image.open(path) as image:
-            exif_data = image.getexif()
-            for tag in ['DateTimeOriginal', 'DateTimeDigitized', 'DateTime']:
-                tag_id = next((k for k, v in TAGS.items() if v == tag), None)
-                if tag_id and tag_id in exif_data:
-                    value = exif_data.get(tag_id)
-                    return datetime.strptime(value, "%Y:%m:%d %H:%M:%S")
-    except:
+        for entry in os.scandir(top_dir):
+            if entry.is_dir(follow_symlinks=False):
+                files.extend(fast_scandir(entry.path, allowed_extensions))
+            elif entry.is_file(follow_symlinks=False):
+                ext = os.path.splitext(entry.name)[1].lower()
+                if ext in allowed_extensions:
+                    files.append(Path(entry.path))
+    except PermissionError:
         pass
+    return files
+
+
+# Cleanup empty subdirectories in source folder after move operation
+def cleanup_empty_folders(top_dir, log_func, dry_run=False):
+    cleaned = 0
+    for root, dirs, files in os.walk(top_dir, topdown=False):
+        for name in dirs:
+            folder_path = Path(root) / name
+            try:
+                if not any(folder_path.iterdir()):
+                    if not dry_run:
+                        folder_path.rmdir()
+                    log_func(f"Cleaned up empty folder: {folder_path.name}")
+                    cleaned += 1
+            except Exception:
+                pass
+    return cleaned
+
+
+# Compute MD5 Hash for Duplicate Detection
+def calculate_file_hash(path: Path, chunk_size=65536):
+    hasher = hashlib.md5()
     try:
-        return datetime.fromtimestamp(path.stat().st_mtime)
-    except:
+        with open(path, "rb") as f:
+            while chunk := f.read(chunk_size):
+                hasher.update(chunk)
+        return hasher.hexdigest()
+    except Exception:
         return None
 
-def sort_files_gui(source_folder, destination_base, log_folder, log_callback,
-                    allowed_extensions, date_start, date_end, progress_callback):
+
+def get_video_date(path: Path):
+    try:
+        parser = createParser(str(path))
+        if parser:
+            with parser:
+                metadata = extractMetadata(parser)
+                if metadata:
+                    for item in metadata.exportPlaintext():
+                        if "Creation date:" in item:
+                            date_str = item.split("Creation date:")[1].strip()
+                            return datetime.strptime(
+                                date_str, "%Y-%m-%d %H:%M:%S"
+                            )
+    except Exception:
+        pass
+    return None
+
+
+def get_date_taken(path: Path):
+    ext = path.suffix.lower()
+
+    if ext in video_extensions:
+        v_date = get_video_date(path)
+        if v_date:
+            return v_date
+
+    if ext in image_extensions:
+        try:
+            with Image.open(path) as image:
+                exif_data = image.getexif()
+                for tag in ["DateTimeOriginal", "DateTimeDigitized", "DateTime"]:
+                    tag_id = next(
+                        (k for k, v in TAGS.items() if v == tag), None
+                    )
+                    if tag_id and tag_id in exif_data:
+                        value = exif_data.get(tag_id)
+                        return datetime.strptime(value, "%Y:%m:%d %H:%M:%S")
+        except Exception:
+            pass
+
+    try:
+        return datetime.fromtimestamp(path.stat().st_mtime)
+    except Exception:
+        return None
+
+
+# Generate unique filename for non-duplicate collisions
+def get_unique_dest_path(dest_folder: Path, original_filename: str):
+    base_path = dest_folder / original_filename
+    if not base_path.exists():
+        return base_path
+
+    stem = base_path.stem
+    suffix = base_path.suffix
+    counter = 1
+
+    while True:
+        candidate = dest_folder / f"{stem}_{counter}{suffix}"
+        if not candidate.exists():
+            return candidate
+        counter += 1
+
+
+# Summary Dialog
+class SummaryWindow(ctk.CTkToplevel):
+    def __init__(self, parent, summary_data):
+        super().__init__(parent)
+        self.title("Run Summary & Skip Log")
+        self.geometry("580x470")
+
+        self.transient(parent)
+        self.grab_set()
+
+        ctk.CTkLabel(
+            self, text="Sorting Summary", font=ctk.CTkFont(size=18, weight="bold")
+        ).pack(pady=(15, 5))
+
+        stats_text = (
+            f"Processed: {summary_data['processed']} | "
+            f"Renamed (Collisions): {summary_data['renamed']} | "
+            f"Skipped (Duplicates): {summary_data['duplicates']}\n"
+            f"Out of Date Range: {summary_data['out_of_range']} | "
+            f"Errors: {len(summary_data['errors'])}"
+        )
+        ctk.CTkLabel(self, text=stats_text, font=ctk.CTkFont(size=12)).pack(
+            pady=(0, 10)
+        )
+
+        ctk.CTkLabel(
+            self, text="Detailed Log / Skipped Items:", font=ctk.CTkFont(weight="bold")
+        ).pack(anchor="w", padx=20)
+
+        textbox = ctk.CTkTextbox(self, height=260)
+        textbox.pack(fill="both", expand=True, padx=20, pady=5)
+
+        if summary_data["skip_details"]:
+            for detail in summary_data["skip_details"]:
+                textbox.insert("end", detail + "\n")
+        else:
+            textbox.insert("end", "No items were skipped or generated errors.")
+
+        ctk.CTkButton(
+            self, text="Close", command=self.destroy, width=100
+        ).pack(pady=12)
+
+
+class FileTypeSettingsWindow(ctk.CTkToplevel):
+    def __init__(self, parent, ext_vars):
+        super().__init__(parent)
+        self.title("File Type Settings")
+        self.geometry("450x420")
+        self.resizable(False, False)
+
+        self.transient(parent)
+        self.grab_set()
+
+        self.ext_vars = ext_vars
+
+        ctk.CTkLabel(
+            self,
+            text="Select Included File Types",
+            font=ctk.CTkFont(size=16, weight="bold"),
+        ).pack(pady=(15, 5))
+
+        quick_btn_frame = ctk.CTkFrame(self, fg_color="transparent")
+        quick_btn_frame.pack(fill="x", padx=20, pady=5)
+
+        ctk.CTkButton(
+            quick_btn_frame,
+            text="Toggle All Photos",
+            command=self.toggle_photos,
+            height=28,
+            fg_color="#3B82F6",
+            hover_color="#2563EB",
+        ).pack(side="left", expand=True, fill="x", padx=(0, 5))
+
+        ctk.CTkButton(
+            quick_btn_frame,
+            text="Toggle All Videos",
+            command=self.toggle_videos,
+            height=28,
+            fg_color="#3B82F6",
+            hover_color="#2563EB",
+        ).pack(side="right", expand=True, fill="x", padx=(5, 0))
+
+        photo_frame = ctk.CTkFrame(self)
+        photo_frame.pack(fill="x", padx=20, pady=10)
+        ctk.CTkLabel(
+            photo_frame, text="Image Types", font=ctk.CTkFont(weight="bold")
+        ).pack(anchor="w", padx=10, pady=(5, 5))
+
+        img_grid = ctk.CTkFrame(photo_frame, fg_color="transparent")
+        img_grid.pack(fill="x", padx=10, pady=(0, 10))
+        for idx, ext in enumerate(image_extensions):
+            cb = ctk.CTkCheckBox(
+                img_grid, text=ext, variable=self.ext_vars[ext]
+            )
+            cb.grid(row=idx // 3, column=idx % 3, padx=10, pady=5, sticky="w")
+
+        video_frame = ctk.CTkFrame(self)
+        video_frame.pack(fill="x", padx=20, pady=10)
+        ctk.CTkLabel(
+            video_frame, text="Video Types", font=ctk.CTkFont(weight="bold")
+        ).pack(anchor="w", padx=10, pady=(5, 5))
+
+        vid_grid = ctk.CTkFrame(video_frame, fg_color="transparent")
+        vid_grid.pack(fill="x", padx=10, pady=(0, 10))
+        for idx, ext in enumerate(video_extensions):
+            cb = ctk.CTkCheckBox(
+                vid_grid, text=ext, variable=self.ext_vars[ext]
+            )
+            cb.grid(row=idx // 3, column=idx % 3, padx=10, pady=5, sticky="w")
+
+        ctk.CTkButton(
+            self,
+            text="Save & Close",
+            command=self.destroy,
+            height=34,
+            fg_color="#28a745",
+            hover_color="#218838",
+        ).pack(pady=10)
+
+    def toggle_photos(self):
+        all_selected = all(
+            self.ext_vars[ext].get() for ext in image_extensions
+        )
+        new_state = not all_selected
+        for ext in image_extensions:
+            self.ext_vars[ext].set(new_state)
+
+    def toggle_videos(self):
+        all_selected = all(
+            self.ext_vars[ext].get() for ext in video_extensions
+        )
+        new_state = not all_selected
+        for ext in video_extensions:
+            self.ext_vars[ext].set(new_state)
+
+
+def sort_files_gui(
+    source_folder,
+    destination_base,
+    log_folder,
+    video_destination_base,
+    use_separate_video_dir,
+    log_callback,
+    allowed_extensions,
+    date_start,
+    date_end,
+    copy_mode,
+    dry_run,
+    cleanup_source,
+    progress_callback,
+    finish_callback,
+):
     source_folder = Path(source_folder)
     destination_base = Path(destination_base)
+    video_destination_base = (
+        Path(video_destination_base)
+        if use_separate_video_dir
+        else destination_base
+    )
     log_folder = Path(log_folder)
     folder_cache = {}
 
+    folder_lock = threading.Lock()
+    hash_lock = threading.Lock()
+    existing_hashes = {}  # Map: MD5 -> Dest Path
+
     start_time = datetime.now()
-    log_file_path = log_folder / f"sort_log_{start_time.strftime('%Y-%m-%d_%H-%M-%S')}.txt"
+    prefix = "[DRY RUN] " if dry_run else ""
+    log_file_path = (
+        log_folder
+        / f"sort_log_{start_time.strftime('%Y-%m-%d_%H-%M-%S')}.txt"
+    )
+
+    summary_data = {
+        "processed": 0,
+        "renamed": 0,
+        "duplicates": 0,
+        "out_of_range": 0,
+        "errors": [],
+        "skip_details": [],
+    }
 
     def log(message):
-        log_callback(message)
-        with open(log_file_path, 'a', encoding='utf-8') as log_file:
-            log_file.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - {message}\n")
+        log_callback(f"{prefix}{message}")
+        with open(log_file_path, "a", encoding="utf-8") as log_file:
+            log_file.write(
+                f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - {prefix}{message}\n"
+            )
 
-    all_files = [p for p in source_folder.rglob("*") if p.is_file() and p.suffix.lower() in allowed_extensions]
+    log("Scanning directory...")
+    all_files = fast_scandir(source_folder, allowed_extensions)
     total = len(all_files)
-    moved = 0
+    log(f"Found {total} target media files.")
 
-    for idx, file_path in enumerate(all_files):
+    def process_file(file_path):
         if cancel_flag.is_set():
-            log("Sorting cancelled by user.")
-            return
+            return None
 
         date_taken = get_date_taken(file_path)
         if not date_taken:
-            log(f"No date found for {file_path.name}, skipping.")
-            continue
+            msg = f"Skipped: No date metadata found for {file_path.name}"
+            return {"type": "skip", "msg": msg, "reason": "no_date"}
 
         if not (date_start <= date_taken <= date_end):
-            continue
+            msg = f"Skipped: {file_path.name} (Date {date_taken.strftime('%Y-%m-%d')} out of range)"
+            return {"type": "skip", "msg": msg, "reason": "out_of_range"}
+
+        is_video = file_path.suffix.lower() in video_extensions
+        target_base = (
+            video_destination_base
+            if (is_video and use_separate_video_dir)
+            else destination_base
+        )
 
         year = str(date_taken.year)
-        month_name = f"{date_taken.month} {date_taken.strftime('%B')} {date_taken.year}"
-        day_name_base = f"{date_taken.month}-{date_taken.day}-{date_taken.year}"
-        cache_key = (year, month_name, day_name_base)
-        dest_folder = folder_cache.get(cache_key)
+        month_name = (
+            f"{date_taken.month} {date_taken.strftime('%B')} {date_taken.year}"
+        )
+        day_name_base = (
+            f"{date_taken.month}-{date_taken.day}-{date_taken.year}"
+        )
+        cache_key = (str(target_base), year, month_name, day_name_base)
 
-        if not dest_folder:
-            parent_folder = destination_base / year / month_name
-            # Search for any folder that starts with day_name_base
-            if parent_folder.exists():
-                for child in parent_folder.iterdir():
-                    if child.is_dir() and child.name.startswith(day_name_base):
-                        dest_folder = child
-                        break
-
-            # If no matching folder found, create one
+        with folder_lock:
+            dest_folder = folder_cache.get(cache_key)
             if not dest_folder:
-                dest_folder = parent_folder / day_name_base
-                dest_folder.mkdir(parents=True, exist_ok=True)
+                parent_folder = target_base / year / month_name
+                if parent_folder.exists():
+                    for child in parent_folder.iterdir():
+                        if child.is_dir() and child.name.startswith(
+                            day_name_base
+                        ):
+                            dest_folder = child
+                            break
 
-            folder_cache[cache_key] = dest_folder
+                if not dest_folder:
+                    dest_folder = parent_folder / day_name_base
+                    if not dry_run:
+                        dest_folder.mkdir(parents=True, exist_ok=True)
 
-        dest_path = dest_folder / file_path.name
+                folder_cache[cache_key] = dest_folder
 
-        if dest_path.exists():
-            log(f"Skipping {file_path.name}: already exists in destination.")
-            continue
+        # 1. Check duplicate content via Hash FIRST
+        file_hash = calculate_file_hash(file_path)
+        if file_hash:
+            with hash_lock:
+                if file_hash in existing_hashes:
+                    dup_target = existing_hashes[file_hash]
+                    msg = f"Skipped Duplicate: {file_path.name} (Matches {dup_target.name})"
+                    return {"type": "skip", "msg": msg, "reason": "duplicate"}
+
+        # 2. Collision Handling: Handle different files with matching filenames
+        with folder_lock:
+            dest_path = get_unique_dest_path(dest_folder, file_path.name)
+            if file_hash:
+                with hash_lock:
+                    existing_hashes[file_hash] = dest_path
+
+        was_renamed = dest_path.name != file_path.name
+
+        # 3. Execute Copy / Move
+        if dry_run:
+            action_str = "Would Copy" if copy_mode else "Would Move"
+            rename_note = (
+                f" (Renamed to {dest_path.name})" if was_renamed else ""
+            )
+            msg = f"{action_str} {file_path.name} -> {dest_folder}{rename_note}"
+            return {"type": "success", "msg": msg, "renamed": was_renamed}
 
         try:
-            shutil.move(str(file_path), str(dest_path))
-            log(f"Moved {file_path.name} to {dest_path}")
-            moved += 1
-        except OSError:
-            try:
+            if copy_mode:
                 shutil.copy2(file_path, dest_path)
-                file_path.chmod(stat.S_IWRITE)
-                file_path.unlink()
-                log(f"Copied and deleted: {file_path.name}")
-                moved += 1
-            except Exception as delete_err:
-                log(f"Copied but failed to delete {file_path.name}: {delete_err}")
+                rename_note = (
+                    f" (Renamed to {dest_path.name})" if was_renamed else ""
+                )
+                msg = f"Copied {file_path.name} to {dest_path}{rename_note}"
+            else:
+                try:
+                    shutil.move(str(file_path), str(dest_path))
+                    rename_note = (
+                        f" (Renamed to {dest_path.name})" if was_renamed else ""
+                    )
+                    msg = f"Moved {file_path.name} to {dest_path}{rename_note}"
+                except OSError:
+                    shutil.copy2(file_path, dest_path)
+                    file_path.chmod(stat.S_IWRITE)
+                    file_path.unlink()
+                    rename_note = (
+                        f" (Renamed to {dest_path.name})" if was_renamed else ""
+                    )
+                    msg = f"Copied and deleted: {file_path.name}{rename_note}"
+            return {"type": "success", "msg": msg, "renamed": was_renamed}
+        except Exception as err:
+            msg = f"Error processing {file_path.name}: {err}"
+            return {"type": "error", "msg": msg}
 
-        progress_callback(int((idx + 1) / total * 100))
+    completed = 0
+    max_workers = min(32, (os.cpu_count() or 1) + 4)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(process_file, f): f for f in all_files}
 
-    log("Sorting completed.")
-    messagebox.showinfo("Done", "Sorting completed successfully!")
+        for future in as_completed(futures):
+            if cancel_flag.is_set():
+                log("Sorting cancelled by user.")
+                break
 
-def run_gui():
-    def browse(entry):
+            result = future.result()
+            completed += 1
+            if progress_callback and total:
+                progress_callback(completed / total)
+
+            if not result:
+                continue
+
+            if result["type"] == "success":
+                summary_data["processed"] += 1
+                if result.get("renamed"):
+                    summary_data["renamed"] += 1
+                log(result["msg"])
+            elif result["type"] == "skip":
+                summary_data["skip_details"].append(result["msg"])
+                log(result["msg"])
+                if result.get("reason") == "duplicate":
+                    summary_data["duplicates"] += 1
+                elif result.get("reason") == "out_of_range":
+                    summary_data["out_of_range"] += 1
+            elif result["type"] == "error":
+                summary_data["errors"].append(result["msg"])
+                summary_data["skip_details"].append(result["msg"])
+                log(result["msg"])
+
+    # Optional Post-Sort Empty Folder Cleanup (Move mode only)
+    if cleanup_source and not copy_mode and not cancel_flag.is_set():
+        log("Cleaning up empty source subfolders...")
+        cleaned_count = cleanup_empty_folders(
+            source_folder, log, dry_run=dry_run
+        )
+        log(f"Cleaned up {cleaned_count} empty folder(s).")
+
+    log("Operation finished.")
+    finish_callback(summary_data)
+
+
+class ModernPhotoSorter(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+
+        self.title("Photo & Video Sorter Pro")
+        self.geometry("700x760")
+        self.resizable(False, False)
+
+        # Variables
+        self.source_var = ctk.StringVar()
+        self.dest_var = ctk.StringVar()
+        self.video_dest_var = ctk.StringVar()
+        self.log_var = ctk.StringVar(
+            value=str(Path.home() / "Pictures" / "Pictures sorting Logs")
+        )
+        self.start_date_var = ctk.StringVar(value="1900-01-01")
+        self.end_date_var = ctk.StringVar(value="2100-12-31")
+        self.action_var = ctk.StringVar(value="move")
+        self.dry_run_var = ctk.BooleanVar(value=False)
+        self.cleanup_source_var = ctk.BooleanVar(value=True)
+
+        all_exts = image_extensions + video_extensions
+        self.ext_vars = {ext: ctk.BooleanVar(value=True) for ext in all_exts}
+
+        self.settings_window = None
+        self.create_widgets()
+
+    def create_widgets(self):
+        header_frame = ctk.CTkFrame(self, fg_color="transparent")
+        header_frame.pack(fill="x", padx=20, pady=(15, 5))
+
+        ctk.CTkLabel(
+            header_frame,
+            text="Media Organizer Pro",
+            font=ctk.CTkFont(size=22, weight="bold"),
+        ).pack(side="left")
+
+        ctk.CTkButton(
+            header_frame,
+            text="⚙ File Types",
+            width=110,
+            command=self.open_settings,
+            fg_color="#4A5568",
+            hover_color="#2D3748",
+        ).pack(side="right")
+
+        # Path Selection Group
+        paths_group = ctk.CTkFrame(self)
+        paths_group.pack(fill="x", padx=20, pady=10)
+
+        self.make_path_row(paths_group, "Source Folder:", self.source_var)
+        self.make_path_row(paths_group, "Photo Destination:", self.dest_var)
+
+        self.sep_video_switch = ctk.CTkSwitch(
+            paths_group,
+            text="Send Videos to Separate Folder",
+            command=self.toggle_video_entry,
+        )
+        self.sep_video_switch.pack(anchor="w", padx=15, pady=(5, 5))
+
+        self.video_entry, self.video_btn = self.make_path_row(
+            paths_group, "Video Destination:", self.video_dest_var
+        )
+        self.video_entry.configure(state="disabled")
+        self.video_btn.configure(state="disabled")
+
+        self.make_path_row(paths_group, "Log Folder:", self.log_var)
+
+        # Configuration Frame
+        config_frame = ctk.CTkFrame(self)
+        config_frame.pack(fill="x", padx=20, pady=10)
+
+        ctk.CTkLabel(
+            config_frame, text="Operation:", font=ctk.CTkFont(weight="bold")
+        ).grid(row=0, column=0, padx=15, pady=10, sticky="w")
+        ctk.CTkRadioButton(
+            config_frame,
+            text="Move Files",
+            variable=self.action_var,
+            value="move",
+            command=self.toggle_cleanup_switch,
+        ).grid(row=0, column=1, padx=10)
+        ctk.CTkRadioButton(
+            config_frame,
+            text="Copy Files",
+            variable=self.action_var,
+            value="copy",
+            command=self.toggle_cleanup_switch,
+        ).grid(row=0, column=2, padx=10)
+
+        # Dry Run Toggle
+        ctk.CTkCheckBox(
+            config_frame,
+            text="Dry Run (Simulation)",
+            variable=self.dry_run_var,
+            font=ctk.CTkFont(weight="bold"),
+        ).grid(row=0, column=3, padx=15, sticky="e")
+
+        # Date Filters
+        ctk.CTkLabel(
+            config_frame, text="Start Date:", font=ctk.CTkFont(weight="bold")
+        ).grid(row=1, column=0, padx=15, pady=10, sticky="w")
+        ctk.CTkEntry(
+            config_frame, textvariable=self.start_date_var, width=110
+        ).grid(row=1, column=1, sticky="w")
+        ctk.CTkLabel(
+            config_frame, text="End Date:", font=ctk.CTkFont(weight="bold")
+        ).grid(row=1, column=2, padx=(10, 5), sticky="e")
+        ctk.CTkEntry(
+            config_frame, textvariable=self.end_date_var, width=110
+        ).grid(row=1, column=3, sticky="w", padx=(0, 15))
+
+        # Cleanup Empty Source Folders Switch
+        self.cleanup_cb = ctk.CTkCheckBox(
+            config_frame,
+            text="Delete empty source folders after move",
+            variable=self.cleanup_source_var,
+        )
+        self.cleanup_cb.grid(
+            row=2, column=0, columnspan=3, padx=15, pady=(0, 10), sticky="w"
+        )
+
+        # Action Buttons
+        btn_frame = ctk.CTkFrame(self, fg_color="transparent")
+        btn_frame.pack(fill="x", padx=20, pady=10)
+
+        self.start_btn = ctk.CTkButton(
+            btn_frame,
+            text="Start Sorting",
+            command=self.start_sort,
+            fg_color="#28a745",
+            hover_color="#218838",
+            height=38,
+        )
+        self.start_btn.pack(side="left", expand=True, fill="x", padx=(0, 5))
+
+        ctk.CTkButton(
+            btn_frame,
+            text="Cancel",
+            command=self.cancel_sort,
+            fg_color="#dc3545",
+            hover_color="#c82333",
+            height=38,
+        ).pack(side="right", expand=True, fill="x", padx=(5, 0))
+
+        # Progress Bar
+        self.progress_bar = ctk.CTkProgressBar(self)
+        self.progress_bar.pack(fill="x", padx=20, pady=10)
+        self.progress_bar.set(0)
+
+        # Log Output Textbox
+        self.log_textbox = ctk.CTkTextbox(self, height=180)
+        self.log_textbox.pack(fill="both", expand=True, padx=20, pady=(0, 15))
+
+    def make_path_row(self, parent, label_text, variable):
+        frame = ctk.CTkFrame(parent, fg_color="transparent")
+        frame.pack(fill="x", padx=15, pady=5)
+        ctk.CTkLabel(frame, text=label_text, width=140, anchor="w").pack(
+            side="left"
+        )
+        entry = ctk.CTkEntry(frame, textvariable=variable)
+        entry.pack(side="left", expand=True, fill="x", padx=(0, 10))
+        btn = ctk.CTkButton(
+            frame, text="Browse", width=80, command=lambda: self.browse(variable)
+        )
+        btn.pack(side="right")
+        return entry, btn
+
+    def browse(self, variable):
         path = filedialog.askdirectory()
         if path:
-            entry.set(path)
+            variable.set(path)
 
-    def start_sort():
+    def toggle_video_entry(self):
+        state = "normal" if self.sep_video_switch.get() else "disabled"
+        self.video_entry.configure(state=state)
+        self.video_btn.configure(state=state)
+
+    def toggle_cleanup_switch(self):
+        is_move_mode = self.action_var.get() == "move"
+        if is_move_mode:
+            self.cleanup_cb.configure(state="normal")
+        else:
+            self.cleanup_cb.configure(state="disabled")
+
+    def open_settings(self):
+        if (
+            self.settings_window is None
+            or not self.settings_window.winfo_exists()
+        ):
+            self.settings_window = FileTypeSettingsWindow(self, self.ext_vars)
+        else:
+            self.settings_window.focus()
+
+    def start_sort(self):
         cancel_flag.clear()
-        log_box.delete('1.0', tk.END)
-        progress_bar['value'] = 0
+        self.log_textbox.delete("1.0", "end")
+        self.progress_bar.set(0)
 
-        source = source_var.get()
-        dest = dest_var.get()
-        log_dir = log_var.get()
-        selected_exts = [ext for ext, var in ext_vars.items() if var.get()]
+        source = self.source_var.get()
+        dest = self.dest_var.get()
+        log_dir = self.log_var.get()
+        video_dest = self.video_dest_var.get()
+        use_sep_video = bool(self.sep_video_switch.get())
+        dry_run = self.dry_run_var.get()
+        cleanup_source = self.cleanup_source_var.get()
+
+        selected_exts = [
+            ext for ext, var in self.ext_vars.items() if var.get()
+        ]
         if not selected_exts:
-            messagebox.showerror("Missing Input", "Select at least one file extension.")
+            messagebox.showerror(
+                "Missing Input",
+                "Select at least one file extension in Settings.",
+            )
             return
 
-        start_date = datetime.strptime(start_date_var.get(), "%Y-%m-%d")
-        end_date = datetime.strptime(end_date_var.get(), "%Y-%m-%d")
+        if not source or not dest:
+            messagebox.showerror(
+                "Missing Input",
+                "Please select both Source and Destination folders.",
+            )
+            return
 
-        Path(log_dir).mkdir(parents=True, exist_ok=True)
+        if use_sep_video and not video_dest:
+            messagebox.showerror(
+                "Missing Input", "Please select a Video Destination Folder."
+            )
+            return
 
-        threading.Thread(target=sort_files_gui, args=(
-            source, dest, log_dir,
-            lambda msg: log_box.insert(tk.END, msg + "\n"),
-            selected_exts, start_date, end_date,
-            lambda pct: progress_bar.configure(value=pct)
-        )).start()
+        try:
+            start_date = datetime.strptime(
+                self.start_date_var.get(), "%Y-%m-%d"
+            )
+            end_date = datetime.strptime(self.end_date_var.get(), "%Y-%m-%d")
+        except ValueError:
+            messagebox.showerror(
+                "Invalid Date", "Dates must be formatted as YYYY-MM-DD."
+            )
+            return
 
-    def cancel_sort():
+        log_path = Path(log_dir)
+
+        # 1. Verify drive existence (Windows specific)
+        if log_path.drive and not Path(log_path.drive + "\\").exists():
+            messagebox.showerror(
+                "Drive Error",
+                f"The specified drive '{log_path.drive}' was not found. Please connect the drive or select a different location.",
+            )
+            return
+
+        # 2. Try creating the log directory safely
+        try:
+            log_path.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            messagebox.showerror("Path Error", f"Could not create folder:\n{e}")
+            return
+
+        copy_mode = self.action_var.get() == "copy"
+
+        self.start_btn.configure(state="disabled")
+
+        threading.Thread(
+            target=sort_files_gui,
+            args=(
+                source,
+                dest,
+                log_dir,
+                video_dest,
+                use_sep_video,
+                lambda msg: self.log_textbox.insert("end", msg + "\n"),
+                selected_exts,
+                start_date,
+                end_date,
+                copy_mode,
+                dry_run,
+                cleanup_source,
+                lambda pct: self.progress_bar.set(pct),
+                self.on_sort_complete,
+            ),
+            daemon=True,
+        ).start()
+
+    def on_sort_complete(self, summary_data):
+        self.start_btn.configure(state="normal")
+        SummaryWindow(self, summary_data)
+
+    def cancel_sort(self):
         cancel_flag.set()
 
-    root = tk.Tk()
-    root.title("Photo Sorter")
-    root.geometry("640x700")
-    root.configure(bg="#f0f0f0")
-
-    style = ttk.Style()
-    style.theme_use("default")
-    style.configure("TButton", padding=6, relief="flat", background="#0078D7", foreground="white")
-    style.configure("TProgressbar", troughcolor="#ddd", background="#4CAF50")
-
-    source_var = StringVar()
-    dest_var = StringVar()
-    log_var = StringVar(value="D:\\Pictures\\Pictures sorting Logs")
-    start_date_var = StringVar(value="1900-01-01")
-    end_date_var = StringVar(value="2100-12-31")
-
-    def make_path_picker(label, var):
-        frame = tk.Frame(root, bg="#f0f0f0")
-        frame.pack(fill="x", padx=10, pady=5)
-        tk.Label(frame, text=label, width=15, bg="#f0f0f0").pack(side=tk.LEFT)
-        tk.Entry(frame, textvariable=var, width=50).pack(side=tk.LEFT, expand=True)
-        ttk.Button(frame, text="Browse", command=lambda: browse(var)).pack(side=tk.LEFT)
-
-    make_path_picker("Source Folder:", source_var)
-    make_path_picker("Destination Folder:", dest_var)
-    make_path_picker("Log Folder:", log_var)
-
-    frame = tk.Frame(root, bg="#f0f0f0")
-    frame.pack(fill="x", padx=10, pady=5)
-    tk.Label(frame, text="Start Date:", bg="#f0f0f0").pack(side=tk.LEFT)
-    tk.Entry(frame, textvariable=start_date_var, width=12).pack(side=tk.LEFT, padx=5)
-    tk.Label(frame, text="End Date:", bg="#f0f0f0").pack(side=tk.LEFT)
-    tk.Entry(frame, textvariable=end_date_var, width=12).pack(side=tk.LEFT)
-
-    tk.Label(root, text="Include File Types:", bg="#f0f0f0").pack()
-    ext_vars = {ext: BooleanVar(value=True) for ext in image_extensions + video_extensions}
-    ext_frame = tk.Frame(root, bg="#f0f0f0")
-    ext_frame.pack()
-    for ext, var in ext_vars.items():
-        tk.Checkbutton(ext_frame, text=ext, variable=var, bg="#f0f0f0").pack(side=tk.LEFT)
-
-    btn_frame = tk.Frame(root, bg="#f0f0f0")
-    btn_frame.pack(pady=10)
-    ttk.Button(btn_frame, text="Start Sorting", command=start_sort).pack(side=tk.LEFT, padx=10)
-    ttk.Button(btn_frame, text="Cancel", command=cancel_sort).pack(side=tk.LEFT, padx=10)
-
-    progress_bar = ttk.Progressbar(root, length=580)
-    progress_bar.pack(pady=5, padx=10)
-
-    log_box = scrolledtext.ScrolledText(root, height=15, wrap=tk.WORD, bg="#ffffff", fg="#000000")
-    log_box.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
-
-    root.mainloop()
 
 if __name__ == "__main__":
-    run_gui()
+    app = ModernPhotoSorter()
+    app.mainloop()
